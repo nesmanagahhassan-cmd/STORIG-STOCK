@@ -10413,48 +10413,37 @@
     }
 
     function _liveAddFeedItem(kind, value, meta) {
-      if (!value || !value.trim()) return;
-      value = value.trim();
-
-      // Dedup: skip same value within 3 seconds
-      const now = Date.now();
-      const last = _liveRecentHits.get(value) || 0;
-      if (now - last < 3000) return;
-      _liveRecentHits.set(value, now);
-
-      // Clean up old entries (> 10s)
-      for (const [k, ts] of _liveRecentHits) {
-        if (now - ts > 10000) _liveRecentHits.delete(k);
-      }
-
+      if (!value) return;
       const feed = document.getElementById('live-feed');
       if (!feed) return;
 
-      // Remove empty placeholder
+      // إزالة رسالة "Point camera..."
       const empty = feed.querySelector('.live-feed-empty');
       if (empty) empty.remove();
 
+      // منع التكرار في القائمة (لو نفس الكود اتقرأ مرتين ورا بعض)
+      if (_liveRecentHits.has(value)) return;
+      _liveRecentHits.set(value, Date.now());
+
       const item = document.createElement('div');
       item.className = 'live-feed-item ' + kind;
-      const icon = kind === 'barcode'
-        ? '<svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="1"/><path d="M7 5v14M11 5v14M15 5v14M19 5v14"/></svg>'
-        : '<svg viewBox="0 0 24 24"><path d="M4 7V4h16v3M9 20h6M12 4v16"/></svg>';
       item.innerHTML = `
-    <div class="live-feed-item-icon">${icon}</div>
+    <div class="live-feed-item-icon">${kind === 'barcode' ? '📷' : 'T'}</div>
     <div class="live-feed-item-body">
-      <div class="live-feed-item-val">${escHtml(value)}</div>
-      <div class="live-feed-item-meta">
-        <span>${kind === 'barcode' ? 'Barcode' : 'OCR text'}</span>
-        ${meta ? `<span>· ${escHtml(_prettyFormatName(meta))}</span>` : ''}
-        <span>· ${new Date().toLocaleTimeString()}</span>
-      </div>
+      <div class="live-feed-item-val">${value}</div>
+      <div class="live-feed-item-meta">${meta || ''}</div>
     </div>
-    <div class="live-feed-item-use">USE</div>
+    <button class="live-feed-item-use">استخدام</button>
   `;
+
+      // عند الضغط على النتيجة، ضعها في الخانة الأساسية واقفل الكاميرا
       item.onclick = () => {
-        onBarcodeScanned(value);
+        document.getElementById('f-barcode').value = value;
+        closeScanModal();
       };
+
       feed.insertBefore(item, feed.firstChild);
+
 
       // Cap feed at 8 items
       const items = feed.querySelectorAll('.live-feed-item');
@@ -10640,24 +10629,28 @@
       if (!_liveRunning || !_liveEnabled.barcode) return;
       const vid = document.getElementById('live-video');
 
-      // تحميل مكتبة ZXing إذا لم تكن موجودة
+      // تحميل المكتبة لو مش موجودة
       if (!window.ZXing) {
         await loadScript('https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js');
       }
 
+      // استخدام القارئ الشامل (يقرأ كل شيء: QR, Barcode, etc)
       const codeReader = new window.ZXing.BrowserMultiFormatReader();
 
-      // البدء في مسح الفيديو مباشرة
+      // بدأ المسح المباشر من الفيديو
       codeReader.decodeFromVideoElement(vid, (result, err) => {
-        if (result && _liveRunning) {
+        if (result && _liveRunning && _liveEnabled.barcode) {
           const code = result.getText();
+          // إضافة النتيجة للقائمة تحت الكاميرا
           _liveAddFeedItem('barcode', code, result.getBarcodeFormat());
-          // تنبيه بسيط عند القراءة
-          if (window.navigator.vibrate) window.navigator.vibrate(100);
+
+          // اهتزاز الموبايل للتنبيه
+          if (window.navigator.vibrate) window.navigator.vibrate(50);
         }
+        // نتجاهل الأخطاء العادية (لما ميكونش فيه باركود قدام الكاميرا)
       });
 
-      _liveZxingReader = codeReader; // لحفظ المحرك وإيقافه لاحقاً
+      _liveZxingReader = codeReader;
     }
 
     // ── Engine 1: Native BarcodeDetector (Chrome/Edge/Android) ───────
@@ -10799,95 +10792,41 @@
 
     // ── OCR loop: every 2.5s, non-blocking ─────────────────────────
     async function _startLiveOCRLoop() {
-      if (!_liveRunning || !_liveEnabled.ocr) return;
+      if (!_liveRunning || !_liveEnabled.ocr || _liveOCRBusy) return;
 
-      // Lazy-load Tesseract (don't block camera start)
       if (!ocrReady || !ocrWorker) {
-        _liveSetStatus('Loading OCR engine (first time only)...');
-        try {
-          await loadTesseractWorker(() => { });
-        } catch (e) {
-          console.warn('[live] Tesseract load failed:', e);
-        }
+        await loadTesseractWorker(); // تأكد من تحميل المحرك
       }
-      if (!ocrReady || !ocrWorker) {
-        _liveSetStatus('OCR unavailable — barcode scanning active');
-        return;
-      }
-
-      _liveSetStatus('Scanning — point at barcode or text');
 
       const vid = document.getElementById('live-video');
       const canvas = document.getElementById('live-ocr-canvas');
       const ctx = canvas.getContext('2d');
 
+      // محرك الـ OCR هيشتغل كل ثانيتين عشان ميستهلكش البطارية ويهنج المتصفح
       _liveOCRTimer = setInterval(async () => {
         if (!_liveRunning || !_liveEnabled.ocr || _liveOCRBusy) return;
         if (vid.readyState < 2 || vid.videoWidth === 0) return;
 
         _liveOCRBusy = true;
         try {
-          // Capture a generous central region (90% w × 70% h) so labels aren't cut off.
-          const r = _liveGetCaptureRegion(vid.videoWidth, vid.videoHeight, 0.9, 0.7);
-          canvas.width = r.w;
-          canvas.height = r.h;
-          ctx.drawImage(vid, r.x, r.y, r.w, r.h, 0, 0, r.w, r.h);
+          // التقاط صورة من الفيديو الحالي
+          canvas.width = vid.videoWidth;
+          canvas.height = vid.videoHeight;
+          ctx.drawImage(vid, 0, 0);
 
-          // Frame stability: only use it to DOWNGRADE confidence, never to skip entirely.
-          const sig = _liveComputeFrameSig(canvas);
-          const stable = _liveFrameIsStable(sig, _liveOCRPrevSig);
-          _liveOCRPrevSig = sig;
-          _liveOCRFramesSeen++;
+          // تحليل الصورة
+          const { data: { text, words } } = await ocrWorker.recognize(canvas);
 
-          // Run Tesseract
-          const { data } = await ocrWorker.recognize(canvas);
-          const overallConf = data?.confidence || 0;
-          const rawText = (data?.text || '').trim();
-
-          // Debug log — helps diagnose if OCR is actually running
-          if (rawText) {
-            console.log('[live-ocr] text:', JSON.stringify(rawText.slice(0, 80)),
-              '| overall conf:', Math.round(overallConf),
-              '| stable:', stable, '| words:', data?.words?.length || 0);
-          }
-
-          if (!rawText || overallConf < 25) {
-            return; // truly nothing readable
-          }
-
-          // ── Strategy: emit everything reasonable, let user pick. ──
-          // 1. Raw lines (3+ chars) — shows user that OCR IS working and what it sees
-          // 2. Serial-like tokens from each line — highlighted as likely candidates
-          const lines = rawText.split('\n').map(l => l.trim()).filter(l => l.length >= 3);
-          const confBadge = `conf ${Math.round(overallConf)}%`;
-
-          for (const line of lines) {
-            // Skip pure-punctuation / pure-whitespace garbage
-            if (!/[A-Za-z0-9]/.test(line)) continue;
-            // Skip lines that are just a single short noise token (<3 chars real content)
-            const alnumOnly = line.replace(/[^A-Za-z0-9]/g, '');
-            if (alnumOnly.length < 3) continue;
-
-            // Add the full line (useful: may be a brand name, model, or multi-word serial)
-            if (line.length <= 60) {
-              _liveAddFeedItem('ocr', line, confBadge);
+          // نبحث عن الكلمات القوية (سيريالات أو أكواد نصية)
+          words.forEach(word => {
+            const clean = word.text.trim().replace(/[^a-zA-Z0-9-]/g, '');
+            // لو الكلمة طولها أكتر من 4 وحروفها واضحة
+            if (clean.length >= 4 && word.confidence > 70) {
+              _liveAddFeedItem('ocr', clean, `Confidence: ${Math.round(word.confidence)}%`);
             }
-
-            // Also extract tight serial-like tokens from the line (no spaces, alnum + dash/dot/underscore)
-            const tokens = line.split(/\s+/).filter(t =>
-              t.length >= 4 && t.length <= 40 &&
-              /^[A-Z0-9][A-Z0-9\-_./:#]*$/i.test(t) &&
-              !/^(.)\1+$/.test(t) // reject all-same-char noise like "0000"
-            );
-            for (const tok of tokens) {
-              // Avoid adding the same string twice if line == token
-              if (tok !== line) {
-                _liveAddFeedItem('ocr', tok, confBadge + ' · token');
-              }
-            }
-          }
+          });
         } catch (e) {
-          console.warn('[live] OCR tick error:', e);
+          console.warn("Live OCR Error:", e);
         } finally {
           _liveOCRBusy = false;
         }
