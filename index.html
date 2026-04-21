@@ -10530,19 +10530,14 @@
       stopLiveAutoScanner();
       _liveClearFeed();
 
-      // Camera requires HTTPS or localhost
       const isSecure = location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1';
       if (!isSecure) {
-        _liveShowError('HTTPS Required',
-          'Live camera requires a secure connection (HTTPS).\n\n' +
-          'Your app is running at: <b>' + location.hostname + '</b>\n\n' +
-          'Open the app via <b>https://</b> (e.g. Firebase Hosting) to use live scanning.\n\n' +
-          'Or use the <b>Photo</b> tab — works on any protocol.');
+        _liveShowError('HTTPS Required', 'Live camera requires a secure connection (HTTPS).');
         return;
       }
 
       if (!navigator.mediaDevices?.getUserMedia) {
-        _liveShowError('Camera not supported', 'Use the <b>Photo</b> tab instead — take a photo with your camera app and it will detect the barcode automatically.');
+        _liveShowError('Camera not supported', 'Use the Photo tab instead.');
         return;
       }
 
@@ -10554,11 +10549,9 @@
       ]) {
         try {
           stream = await navigator.mediaDevices.getUserMedia(c);
-          // --- أضف هذا الجزء داخل دالة startLiveAutoScanner بعد سطر getUserMedia ---
           const track = stream.getVideoTracks()[0];
           const capabilities = track.getCapabilities ? track.getCapabilities() : {};
 
-          // تفعيل التركيز المستمر إذا كان الهاتف يدعم ذلك
           if (capabilities.focusMode && capabilities.focusMode.includes('continuous')) {
             await track.applyConstraints({
               advanced: [{ focusMode: 'continuous' }]
@@ -10572,33 +10565,19 @@
       }
 
       if (!stream) {
-        const name = lastErr?.name || '';
-        if (name === 'NotAllowedError') {
-          _liveShowError('Permission denied',
-            'Camera access was blocked.\n\n' +
-            '<b>Chrome/Edge:</b> Click 🔒 in address bar → Camera → Allow → reload\n' +
-            '<b>Firefox:</b> Click camera icon in address bar → Allow\n' +
-            '<b>Safari:</b> Settings → Websites → Camera → Allow\n\n' +
-            'Or use the <b>Photo</b> tab — no permission needed.');
-        } else if (name === 'NotFoundError') {
-          _liveShowError('No camera found', 'Use the <b>Photo</b> tab instead.');
-        } else {
-          _liveShowError('Camera unavailable', (lastErr?.message || 'Could not start camera.') + '\n\nUse the <b>Photo</b> tab.');
-        }
+        _liveShowError('Camera unavailable', 'Could not start camera.');
         return;
       }
 
       _liveStream = stream;
       _liveTrack = stream.getVideoTracks()[0];
 
-      // Reset zoom state
       _liveZoom = 1.0;
       _liveZoomMode = 'software';
       _liveZoomMin = 1.0;
       _liveZoomMax = 5.0;
       _liveZoomStep = 0.1;
 
-      // Check for torch (flashlight) and hardware zoom capabilities
       try {
         const caps = _liveTrack.getCapabilities ? _liveTrack.getCapabilities() : {};
         if (caps.torch) {
@@ -10608,16 +10587,12 @@
         if (caps.zoom && typeof caps.zoom.max === 'number' && caps.zoom.max > (caps.zoom.min || 1)) {
           _liveZoomMode = 'hardware';
           _liveZoomMin = caps.zoom.min || 1;
-          _liveZoomMax = Math.min(caps.zoom.max, 10); // cap at 10x even if device says more
+          _liveZoomMax = Math.min(caps.zoom.max, 10);
           _liveZoomStep = caps.zoom.step || 0.1;
           _liveZoom = _liveTrack.getSettings?.().zoom || _liveZoomMin;
-          console.log('[live-zoom] hardware zoom supported:', _liveZoomMin, '-', _liveZoomMax, 'step:', _liveZoomStep);
-        } else {
-          console.log('[live-zoom] hardware zoom NOT supported — using software zoom fallback');
         }
       } catch (e) { console.warn('[live-zoom] capability check failed:', e); }
 
-      // Wire up slider with actual range, and set initial value
       const slider = document.getElementById('live-zoom-slider');
       if (slider) {
         slider.min = _liveZoomMin;
@@ -10630,7 +10605,7 @@
       const vid = document.getElementById('live-video');
       vid.srcObject = stream;
       vid.style.display = 'block';
-      vid.style.transform = 'scale(1)'; // reset any prior scale
+      vid.style.transform = 'scale(1)';
 
       await new Promise(res => {
         let done = false;
@@ -10641,13 +10616,16 @@
       });
       try { await vid.play(); } catch (e) { console.warn('[live] play rejected:', e); }
 
+      // --- الإصلاح هنا: تفعيل المحركات برمجياً عند البدء ---
+      _liveEnabled.barcode = true;
+      _liveEnabled.ocr = true;
       _liveRunning = true;
-      _liveSetUI('running');
+      _liveAutoApplied = false; // لإعادة تفعيل القراءة الآلية لأول عنصر يظهر
 
-      // Attach pinch gesture + wheel zoom
+      _liveSetUI('running');
       _attachLiveZoomGestures();
 
-      // Start both loops
+      // تشغيل المحركين معاً
       _startLiveBarcodeLoop();
       _startLiveOCRLoop();
     }
