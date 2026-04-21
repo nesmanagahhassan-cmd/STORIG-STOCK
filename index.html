@@ -5,9 +5,36 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Inventory Tracker Pro</title>
+  <!-- إعدادات التطبيق للموبايل -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="InvTracker Pro">
+  <link rel="apple-touch-icon" href="https://cdn-icons-png.flaticon.com/512/3081/3081559.png">
+
+  <!-- رابط ملف الـ Manifest (سأعطيك محتواه بالأسفل) -->
+  <link rel="manifest"
+    href="data:application/json;base64,ewogICJuYW1lIjogIkludmVudG9yeSBUcmFja2VyIFBybyIsCiAgInNob3J0X25hbWUiOiAiSW52VHJhY2tlciIsCiAgInN0YXJ0X3VybCI6ICIuIiwKICAiZGlzcGxheSI6ICJzdGFuZGFsb25lIiwKICAiYmFja2dyb3VuZF9jb2xvciI6ICIjMGYxMTE3IiwKICAidGhlbWVfY29sb3IiOiAiI2Y1OWUwYiIsCiAgImljb25zIjogWwogICAgewogICAgICAic3JjIjogImh0dHBzOi8vY2RuLWljb25zLXBuZy5mbGF0aWNvbi5jb20vNTEyLzMwODEvMzA4MTU1OS5wbmciLAogICAgICAic2l6ZXMiOiAiNTEyeDUxMiIsCiAgICAgICJ0eXBlIjogImltYWdlL3BuZyIsCiAgICAgICJwdXJwb3NlIjogImFueSBtYXNrYWJsZSIKICAgIH1KICBdCn0=">
   <link
     href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap"
     rel="stylesheet" />
+  <!-- ربط ملف المانيفست -->
+  <link rel="manifest" href="manifest.json">
+
+  <!-- إعدادات الأيفون -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="apple-touch-icon" href="https://cdn-icons-png.flaticon.com/512/3081/3081559.png">
+
+  <script>
+    // تفعيل الـ Service Worker برمجياً
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('sw.js')
+          .then(reg => console.log('Service Worker Registered!'))
+          .catch(err => console.log('SW Registration Failed', err));
+      });
+    }
+  </script>
   <style>
     :root {
       --bg: #0f1117;
@@ -10672,105 +10699,62 @@
     // ─── محرك المسح الشامل المطور ───
     let _liveOCRWorker = null;
 
+    // مكتبات المسح العالمية
+    const ZXING_URL = "https://unpkg.com/@zxing/library@latest";
+
     async function startLiveAutoScanner() {
       _liveSetUI('loading');
       stopLiveAutoScanner();
       _liveClearFeed();
 
-      // التحقق من الأمان (HTTPS)
-      const isSecure = location.protocol === 'https:' || location.hostname === 'localhost';
-      if (!isSecure) {
-        _liveShowError('خطأ في الأمان', 'المسح المباشر يتطلب اتصال HTTPS آمن.');
-        return;
+      // 1. تحميل المكتبة إذا لم تكن موجودة
+      if (!window.ZXing) {
+        await loadScript(ZXING_URL);
       }
 
+      const vid = document.getElementById('live-video');
+
+      // 2. إعدادات الكاميرا للأيفون والأندرويد
+      const constraints = {
+        video: {
+          facingMode: 'environment',
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        }
+      };
+
       try {
-        await loadRequiredScripts(); // تحميل المحركات
-
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
-        });
-
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
         _liveStream = stream;
-        const vid = document.getElementById('live-video');
         vid.srcObject = stream;
-        vid.style.display = 'block';
-        await vid.play();
+
+        // الأيفون يحتاج هذه الخصائص للعمل داخل المتصفح
+        vid.setAttribute('playsinline', 'true');
+        vid.setAttribute('muted', 'true');
+        vid.play();
 
         _liveRunning = true;
         _liveSetUI('running');
 
-        // 1. بدء محرك الباركود و QR (سريع جداً: كل 300 مللي ثانية)
+        // 3. تشغيل الماسح (Barcode + QR)
         const codeReader = new ZXing.BrowserMultiFormatReader();
         _liveZxingReader = codeReader;
 
+        // المسح المستمر
         codeReader.decodeFromVideoElement(vid, (result, err) => {
-          if (result && _liveEnabled.barcode) {
+          if (result && _liveRunning) {
             _liveAddFeedItem('barcode', result.getText(), result.getBarcodeFormat());
-            // تنبيه صوتي خفيف عند النجاح (اختياري)
-            if (window.vibrate) navigator.vibrate(50);
+            // اهتزاز الموبايل عند المسح الناجح
+            if (navigator.vibrate) navigator.vibrate(100);
           }
         });
 
-        // 2. بدء محرك OCR (النصوص) (أبطأ قليلاً لتوفير المعالج: كل 2 ثانية)
-        if (!_liveOCRWorker) {
-          _liveOCRWorker = await Tesseract.createWorker('eng');
-          await _liveOCRWorker.setParameters({
-            tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-/. ',
-          });
-        }
-
-        _liveOCRTimer = setInterval(async () => {
-          if (!_liveRunning || !_liveEnabled.ocr || _liveOCRBusy) return;
-
-          _liveOCRBusy = true;
-          const canvas = document.getElementById('live-ocr-canvas');
-          const ctx = canvas.getContext('2d');
-
-          // نأخذ لقطة من الفيديو للمسح
-          canvas.width = vid.videoWidth;
-          canvas.height = vid.videoHeight;
-          ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
-
-          try {
-            const { data: { text, confidence } } = await _liveOCRWorker.recognize(canvas);
-            if (confidence > 70) {
-              const lines = text.split('\n').filter(l => l.trim().length > 4);
-              lines.forEach(line => {
-                // استخراج الكلمات التي تبدو كأرقام تسلسلية أو باركود
-                const matches = line.match(/[A-Z0-9-]{5,}/g);
-                if (matches) {
-                  matches.forEach(m => _liveAddFeedItem('ocr', m, `ثقة: ${Math.round(confidence)}%`));
-                }
-              });
-            }
-          } catch (e) {
-            console.error("OCR Error:", e);
-          } finally {
-            _liveOCRBusy = false;
-          }
-        }, 2000);
-        const constraints = {
-          video: {
-            facingMode: 'environment',
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-            // إضافة ميزات التركيز للأندرويد والأيفون الحديث
-            focusMode: 'continuous',
-            whiteBalance: 'continuous'
-          }
-        };
-
-        try {
-          const stream = await navigator.mediaDevices.getUserMedia(constraints);
-          // ... بقية الكود ...
-        } catch (e) {
-          // ... معالجة الخطأ ...
-        }
-
+        // 4. تشغيل الـ OCR (اختياري - يفضل تشغيله عند الطلب لتوفير البطارية)
+        startLiveOCRLoop();
 
       } catch (err) {
-        _liveShowError('فشل الكاميرا', 'تعذر الوصول إلى الكاميرا: ' + err.message);
+        console.error("Camera Error:", err);
+        _liveShowError('خطأ في الكاميرا', 'تأكد من إعطاء إذن الكاميرا للسفاري أو الكروم.');
       }
     }
 
@@ -11306,6 +11290,22 @@
         { id: 'd8', barcode: 'SN-HUAWEI-AP01', brand: 'Huawei', model: 'AP362E', type: 'Access Point', status: 'Maintenance', qty: 4, location: 'Floor 1', assigned: '', pdate: '2023-04-15', notes: 'Pending firmware update', added: '2024-03-01T09:00:00Z' }
       ];
       inv = demo; save(); updateSidebar(); refreshDashboard();
+    }
+    let deferredPrompt;
+    window.addEventListener('beforeinstallprompt', (e) => {
+      e.preventDefault();
+      deferredPrompt = e;
+      // يمكنك إظهار زر مخصص هنا "تثبيت التطبيق"
+      console.log("التطبيق جاهز للتثبيت على أندرويد");
+    });
+
+    // للأيفون: يجب إخبار المستخدم أن يضغط على زر "Share" ثم "Add to Home Screen"
+    if (isIOS() && !window.navigator.standalone) {
+      toast("لتثبيت التطبيق على الأيفون: اضغط على زر المشاركة ثم Add to Home Screen", "info", 5000);
+    }
+
+    function isIOS() {
+      return /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
     }
   </script>
 </body>
