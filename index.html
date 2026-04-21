@@ -6568,6 +6568,13 @@
         <div class="scan-viewport-wrap" id="live-viewport-wrap">
           <video id="live-video" autoplay playsinline muted
             style="width:100%;max-height:320px;display:none;background:#000;object-fit:cover;border-radius:8px;transform-origin:center center;transition:transform .15s linear"></video>
+          <div id="ocr-target-box"
+            style="position: absolute; border: 2px solid var(--amber); width: 80%; height: 60px; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 10; box-shadow: 0 0 0 9999px rgba(0,0,0,0.5); pointer-events: none;">
+            <div
+              style="position: absolute; top: -25px; color: var(--amber); width: 100%; text-align: center; font-size: 12px; font-weight: bold; text-shadow: 1px 1px 2px #000;">
+              ضع النص هنا</div>
+          </div>
+          <canvas id="live-ocr-canvas" style="display:none"></canvas>
           <canvas id="live-canvas" style="display:none"></canvas>
           <canvas id="live-ocr-canvas" style="display:none"></canvas>
           <div class="scan-overlay-frame" id="live-frame-overlay" style="display:none">
@@ -6893,6 +6900,102 @@
     async function loadRequiredScripts() {
       if (!window.ZXing) await loadScript(ZXING_SCRIPT);
       if (!window.Tesseract) await loadScript(TESSERACT_SCRIPT);
+    }
+    // ─── محرك OCR المحسن للهواتف (iPhone & Android) ───
+    let _ocrWorker = null;
+    let _isWorkerLoading = false;
+
+    async function initOCR() {
+      if (_ocrWorker) return _ocrWorker;
+      if (_isWorkerLoading) return null;
+
+      _isWorkerLoading = true;
+      _liveSetStatus("جاري تجهيز محرك البحث...");
+
+      try {
+        // تحميل Tesseract.js
+        if (!window.Tesseract) {
+          await loadScript("https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js");
+        }
+
+        _ocrWorker = await Tesseract.createWorker('eng', 1, {
+          logger: m => {
+            if (m.status === 'recognizing text') {
+              _liveSetStatus(`جاري القراءة: ${Math.round(m.progress * 100)}%`);
+            }
+          }
+        });
+
+        // إعدادات خاصة لزيادة الدقة في الأرقام التسلسلية
+        await _ocrWorker.setParameters({
+          tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-/.', // التركيز على الحروف والأرقام فقط
+          tessedit_pageseg_mode: '7', // معاملة النص كسطر واحد (مهم جداً للأيفون)
+        });
+
+        _isWorkerLoading = false;
+        return _ocrWorker;
+      } catch (e) {
+        console.error("OCR Init Error:", e);
+        _isWorkerLoading = false;
+        return null;
+      }
+    }
+
+    async function startLiveOCRLoop() {
+      if (!_liveRunning || !_liveEnabled.ocr) return;
+
+      const worker = await initOCR();
+      if (!worker) return;
+
+      const vid = document.getElementById('live-video');
+      const canvas = document.getElementById('live-ocr-canvas');
+      const ctx = canvas.getContext('2d');
+
+      _liveOCRTimer = setInterval(async () => {
+        if (!_liveRunning || !_liveEnabled.ocr || _liveOCRBusy) return;
+        if (vid.readyState < 2) return;
+
+        _liveOCRBusy = true;
+
+        // ─── تقنية القص الذكي (Focus Cropping) ───
+        // نقوم بقص منطقة الصندوق فقط لإرسالها للمحرك، مما يسرع العملية جداً
+        const box = {
+          w: vid.videoWidth * 0.8,
+          h: 100,
+          x: vid.videoWidth * 0.1,
+          y: (vid.videoHeight / 2) - 50
+        };
+
+        canvas.width = box.w;
+        canvas.height = box.h;
+
+        // تحسين الصورة قبل القراءة (Grayscale & Contrast)
+        ctx.filter = 'grayscale(1) contrast(1.5) brightness(1.2)';
+        ctx.drawImage(vid, box.x, box.y, box.w, box.h, 0, 0, box.w, box.h);
+
+        try {
+          const { data: { text, confidence } } = await worker.recognize(canvas);
+
+          if (text && confidence > 60) {
+            // تنظيف النص من الرموز الغريبة
+            const cleanText = text.replace(/[^A-Z0-9-]/gi, '').trim();
+
+            if (cleanText.length > 3) {
+              _liveAddFeedItem('ocr', cleanText, `دقة: ${Math.round(confidence)}%`);
+
+              // إذا كانت الدقة عالية جداً، اهتزاز بسيط للتنبيه
+              if (confidence > 85 && window.navigator.vibrate) {
+                window.navigator.vibrate(50);
+              }
+            }
+          }
+        } catch (e) {
+          console.warn("OCR Frame Error:", e);
+        } finally {
+          _liveOCRBusy = false;
+          _liveSetStatus("جاري المسح المباشر...");
+        }
+      }, 1500); // القراءة كل 1.5 ثانية لتحقيق توازن بين السرعة وحرارة الهاتف
     }
     // ── Storage ────────────────────────────────────────────────────────
     function load() {
@@ -10647,6 +10750,24 @@
             _liveOCRBusy = false;
           }
         }, 2000);
+        const constraints = {
+          video: {
+            facingMode: 'environment',
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            // إضافة ميزات التركيز للأندرويد والأيفون الحديث
+            focusMode: 'continuous',
+            whiteBalance: 'continuous'
+          }
+        };
+
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia(constraints);
+          // ... بقية الكود ...
+        } catch (e) {
+          // ... معالجة الخطأ ...
+        }
+
 
       } catch (err) {
         _liveShowError('فشل الكاميرا', 'تعذر الوصول إلى الكاميرا: ' + err.message);
