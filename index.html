@@ -6886,6 +6886,14 @@
     const PAGE_SIZE = 20;
     let selectedIds = new Set();  // bulk selection
 
+    // تحميل المكتبات خارجياً لضمان عملها
+    const ZXING_SCRIPT = "https://unpkg.com/@zxing/library@latest";
+    const TESSERACT_SCRIPT = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
+
+    async function loadRequiredScripts() {
+      if (!window.ZXing) await loadScript(ZXING_SCRIPT);
+      if (!window.Tesseract) await loadScript(TESSERACT_SCRIPT);
+    }
     // ── Storage ────────────────────────────────────────────────────────
     function load() {
       try {
@@ -7514,7 +7522,6 @@
       if (file && file.type.startsWith('image/')) await decodeBarcodeFromFile(file);
     }
 
-    // --- استبدل دالة decodeBarcodeFromFile بهذا الكود ---
     async function decodeBarcodeFromFile(file) {
       const idleEl = document.getElementById('scan-capture-idle');
       const procEl = document.getElementById('scan-processing');
@@ -7526,47 +7533,83 @@
       resEl.classList.remove('show');
       errEl.classList.remove('show');
 
+      const procText = procEl.querySelector('div:last-child');
+      const setStatus = (t) => { if (procText) procText.textContent = t; };
+      setStatus('Reading image...');
+
+      let code = null;
+      const log = [];
+
       try {
+        // FileReader — works in all environments, no objectURL CSP issues
         const dataUrl = await fileToDataUrl(file);
+        log.push('img:ok');
+
         const canvas = await dataUrlToCanvas(dataUrl);
-        let code = null;
+        log.push(`${canvas.width}x${canvas.height}`);
 
-        // المحاولة الأولى: استخدام تقنية المتصفح الأصلية (سريعة جداً للـ QR والباركود)
+        // Method 1: BarcodeDetector (Chrome/Edge/Android — native, no CDN)
         if ('BarcodeDetector' in window) {
-          const detector = new BarcodeDetector();
-          const hits = await detector.detect(canvas);
-          if (hits.length > 0) code = hits[0].rawValue;
-        }
-
-        // المحاولة الثانية: استخدام ZXing (الأقوى للـ QR والباركود المشوه)
-        if (!code) {
-          if (!window.ZXing) {
-            await loadScript('https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js');
-          }
-          const reader = new window.ZXing.MultiFormatReader();
-          const luminanceSource = new window.ZXing.HTMLCanvasElementLuminanceSource(canvas);
-          const binaryBitmap = new window.ZXing.BinaryBitmap(new window.ZXing.HybridBinarizer(luminanceSource));
+          setStatus('Scanning (1/4)...');
+          console.log('[BD-upload] available; canvas =', canvas.width, 'x', canvas.height);
           try {
-            const result = reader.decode(binaryBitmap);
-            code = result.getText();
-          } catch (e) { console.log("ZXing normal failed, trying hard..."); }
-        }
+            let fmts = ['qr_code', 'ean_13', 'ean_8', 'code_128', 'code_39', 'upc_a', 'upc_e', 'itf', 'data_matrix', 'pdf_417', 'aztec', 'code_93'];
+            try {
+              const sup = await BarcodeDetector.getSupportedFormats();
+              console.log('[BD-upload] supported formats:', sup);
+              fmts = fmts.filter(f => sup.includes(f));
+            } catch (e) { console.error('[BD-upload] getSupportedFormats threw:', e); }
+            console.log('[BD-upload] using formats:', fmts);
+            if (fmts.length === 0) {
+              console.warn('[BD-upload] formats empty — falling back to browser default');
+            }
+            const det = (fmts.length === 0) ? new BarcodeDetector() : new BarcodeDetector({ formats: fmts });
+            const hits = await det.detect(canvas);
+            console.log('[BD-upload] canvas detect hits:', hits.length, hits);
+            if (hits.length > 0) { code = hits[0].rawValue; log.push('BD:✓'); }
+            else {
+              try {
+                const blob = await canvasToBlob(canvas);
+                const hits2 = await det.detect(blob);
+                console.log('[BD-upload] blob detect hits:', hits2.length, hits2);
+                if (hits2.length > 0) { code = hits2[0].rawValue; log.push('BD-blob:✓'); }
+                else { log.push('BD:miss'); }
+              } catch (e2) { console.error('[BD-upload] blob detect threw:', e2); log.push('BD:miss'); }
+            }
+          } catch (e) { console.error('[BD-upload] outer threw:', e); log.push('BD:err(' + (e.name || '').slice(0, 12) + ')'); }
+        } else { console.log('[BD-upload] BarcodeDetector NOT in window'); log.push('BD:unavail'); }
 
-        if (code) {
-          document.getElementById('scan-upload-result-val').textContent = code;
-          resEl.classList.add('show');
-          setTimeout(() => onBarcodeScanned(code), 500);
-        } else {
-          errEl.classList.add('show');
-          errEl.innerHTML = "لم يتم العثور على باركود واضح. حاول التقاط صورة أقرب وأكثر إضاءة.";
-        }
-      } catch (err) {
-        console.error(err);
+        // Method 2: ZXing RGBLuminanceSource
+        if (!code) { setStatus('Scanning (2/4)...'); code = await tryZXingRGB(canvas, log); }
+
+        // Method 3: jsQR (pure JS QR decoder)
+        if (!code) { setStatus('Scanning (3/4)...'); code = await tryJsQR(canvas, log); }
+
+        // Method 4: Quagga2 (1D barcodes)
+        if (!code) { setStatus('Scanning (4/4)...'); code = await tryQuagga(canvas, log); }
+
+      } catch (outerErr) {
+        log.push('ERR:' + (outerErr.message || 'unknown').slice(0, 35));
+        console.warn('decodeBarcodeFromFile:', outerErr);
+      }
+
+      procEl.style.display = 'none';
+      idleEl.style.display = '';
+
+      if (code) {
+        document.getElementById('scan-upload-result-val').textContent = code;
+        resEl.classList.add('show');
+        setTimeout(() => onBarcodeScanned(code), 400);
+      } else {
+        errEl.innerHTML = `
+      <b>Barcode not detected</b>&nbsp;
+      <span style="font-size:10px;color:var(--text3);font-family:var(--mono)">[${log.join(' → ')}]</span><br><br>
+      <b>Tips:</b> Sharp photo · Barcode fills 30%+ of frame · No glare<br><br>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:8px">
+        <button class="btn btn-sm" onclick="document.getElementById('scan-file-camera').click()">📷 Retake</button>
+        <button class="btn btn-sm" onclick="document.getElementById('scan-file-gallery').click()">🖼 Choose Image</button>
+      </div>`;
         errEl.classList.add('show');
-        errEl.textContent = "حدث خطأ أثناء معالجة الصورة.";
-      } finally {
-        procEl.style.display = 'none';
-        idleEl.style.display = '';
       }
     }
 
@@ -10127,31 +10170,10 @@
 
     // ── File handler ─────────────────────────────────────────────
     async function handleOCRUpload(event) {
-      const file = event.target.files[0];
+      const file = event.target.files?.[0];
+      event.target.value = '';
       if (!file) return;
-
-      // إظهار واجهة التحميل
-      document.getElementById('ocr-idle').style.display = 'none';
-      document.getElementById('ocr-processing').style.display = 'block';
-      document.getElementById('ocr-progress-bar').style.width = '20%';
-
-      try {
-        await loadTesseractWorker(); // تأكد من جاهزية المحرك
-
-        const result = await ocrWorker.recognize(file);
-        const text = result.data.text.trim();
-
-        if (text) {
-          displayOCRResult(text, result.data.words);
-          document.getElementById('ocr-processing').style.display = 'none';
-          document.getElementById('ocr-result-box').classList.add('show');
-        } else {
-          throw new Error("لم يتم العثور على نص");
-        }
-      } catch (e) {
-        toast("لم نتمكن من قراءة النص، حاول مرة أخرى", "error");
-        resetOCRPanel();
-      }
+      await runOCROnFile(file);
     }
 
     // ── Run OCR on image file ─────────────────────────────────────
@@ -10224,13 +10246,14 @@
     }
 
     // ── Load Tesseract worker ─────────────────────────────────────
-    // --- استبدل دالة loadTesseractWorker بهذا الكود ---
     async function loadTesseractWorker(onProgress) {
       if (ocrWorker && ocrReady) return;
       try {
         if (!window.Tesseract) {
           await loadScript('https://cdn.jsdelivr.net/npm/tesseract.js@5.0.4/dist/tesseract.min.js');
         }
+        if (!window.Tesseract) { console.warn('Tesseract CDN blocked'); return; }
+
         ocrWorker = await window.Tesseract.createWorker('eng', 1, {
           logger: m => {
             if (m.status === 'recognizing text' && onProgress) {
@@ -10238,39 +10261,18 @@
             }
           }
         });
-
-        // إعدادات هامة لرفع دقة قراءة السيريال نمبر والباركود النصي
         await ocrWorker.setParameters({
-          tessedit_pageseg_mode: '7', // معامل 7 يعني معاملة النص كسطر واحد (مثالي للسيريال نمبر)
-          tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-/.', // التركيز على الحروف والأرقام فقط
+          // PSM 6 = Assume a single uniform block of text.
+          // Best fit for labels, serial stickers, packaging — NOT for full pages.
+          // Default PSM 3 (auto) assumes full-page layout and performs worse on small crops.
+          tessedit_pageseg_mode: '6',
+          tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_./: #()',
+          // Keep spaces between words preserved in output (helps token extraction)
+          preserve_interword_spaces: '1'
         });
         ocrReady = true;
       } catch (e) {
-        console.warn('OCR Init failed:', e);
-      }
-    }
-
-    async function loadTesseractWorker() {
-      if (ocrWorker && ocrReady) return;
-      try {
-        if (!window.Tesseract) {
-          await loadScript('https://cdn.jsdelivr.net/npm/tesseract.js@5.0.4/dist/tesseract.min.js');
-        }
-
-        // إعداد المحرك للعمل بدون الحاجة لتخزين محلي (حل مشكلة Tracking Prevention)
-        ocrWorker = await Tesseract.createWorker('eng', 1, {
-          workerPath: 'https://cdn.jsdelivr.net/npm/tesseract.js@5.0.4/dist/worker.min.js',
-          corePath: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@5.0.0/tesseract-core.wasm.js',
-          logger: m => console.log(m.status)
-        });
-
-        await ocrWorker.setParameters({
-          tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-/.',
-          tessedit_pageseg_mode: '7',
-        });
-        ocrReady = true;
-      } catch (e) {
-        console.error("OCR Error:", e);
+        console.warn('Tesseract init failed:', e);
       }
     }
 
@@ -10459,41 +10461,40 @@
 
     function _liveAddFeedItem(kind, value, meta) {
       if (!value) return;
+      value = value.trim();
+
+      // منع التكرار السريع لنفس القيمة
+      const now = Date.now();
+      if (_liveRecentHits.has(value) && (now - _liveRecentHits.get(value) < 5000)) return;
+      _liveRecentHits.set(value, now);
+
       const feed = document.getElementById('live-feed');
-      if (!feed) return;
-
-      // تنظيف القيمة من أي مسافات زائدة
-      const displayValue = value.trim();
-
-      // منع التكرار
-      if (_liveRecentHits.has(displayValue)) return;
-      _liveRecentHits.set(displayValue, Date.now());
+      const empty = feed.querySelector('.live-feed-empty');
+      if (empty) empty.remove();
 
       const item = document.createElement('div');
       item.className = 'live-feed-item ' + kind;
-
-      // تحديد الأيقونة: لو لينك يظهر علامة رابط، لو رقم يظهر علامة باركود
-      const isUrl = displayValue.startsWith('http');
-      const icon = isUrl ? '🔗' : (kind === 'barcode' ? '🔢' : '📝');
-      const label = isUrl ? 'رابط (URL)' : 'كود / رقم';
-
       item.innerHTML = `
-        <div class="live-feed-item-icon" style="font-size:20px">${icon}</div>
-        <div class="live-feed-item-body">
-            <div class="live-feed-item-val" style="word-break: break-all; font-family: monospace;">${displayValue}</div>
-            <div class="live-feed-item-meta">${label} · ${meta || ''}</div>
-        </div>
-        <button class="live-feed-item-use">استخدام</button>
-    `;
+    <div class="live-feed-item-icon">
+      ${kind === 'barcode' ? '📊' : '📝'}
+    </div>
+    <div class="live-feed-item-body">
+      <div class="live-feed-item-val">${value}</div>
+      <div class="live-feed-item-meta">${kind === 'barcode' ? 'باركود/QR' : 'نص مستخرج'} | ${meta || ''}</div>
+    </div>
+    <button class="btn btn-sm btn-primary">استخدام</button>
+  `;
 
       item.onclick = () => {
-        document.getElementById('f-barcode').value = displayValue;
-        toast("تم اختيار الرقم: " + displayValue);
+        document.getElementById('f-barcode').value = value;
+        toast("تم اختيار القيمة: " + value, "success");
         closeScanModal();
       };
 
       feed.insertBefore(item, feed.firstChild);
 
+      // الاحتفاظ بآخر 5 نتائج فقط
+      if (feed.children.length > 5) feed.lastChild.remove();
 
 
       // Cap feed at 8 items
@@ -10565,127 +10566,111 @@
     }
 
     // ── Main entry: start live auto scanner ─────────────────────────
+    // ─── محرك المسح الشامل المطور ───
+    let _liveOCRWorker = null;
+
     async function startLiveAutoScanner() {
       _liveSetUI('loading');
       stopLiveAutoScanner();
       _liveClearFeed();
 
-      const isSecure = location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+      // التحقق من الأمان (HTTPS)
+      const isSecure = location.protocol === 'https:' || location.hostname === 'localhost';
       if (!isSecure) {
-        _liveShowError('HTTPS Required', 'Live camera requires a secure connection (HTTPS).');
+        _liveShowError('خطأ في الأمان', 'المسح المباشر يتطلب اتصال HTTPS آمن.');
         return;
       }
-
-      if (!navigator.mediaDevices?.getUserMedia) {
-        _liveShowError('Camera not supported', 'Use the Photo tab instead.');
-        return;
-      }
-
-      let stream, lastErr;
-      const constraints = {
-        video: {
-          facingMode: "environment",
-          // نستخدم الـ ideal بدل الـ exact عشان الأيفون ميرفضش الطلب
-          width: { ideal: 1280 },
-          height: { ideal: 720 }
-        },
-        audio: false
-      };
 
       try {
-        stream = await navigator.mediaDevices.getUserMedia(constraints);
-      } catch (e) {
-        // محاولة أخيرة لو الأيفون رفض الإعدادات العالية
-        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
-      }
-      for (const c of [
-        { video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } } },
-        { video: { facingMode: 'environment' } },
-        { video: true }
-      ]) {
-        try {
-          stream = await navigator.mediaDevices.getUserMedia(c);
-          const track = stream.getVideoTracks()[0];
-          const capabilities = track.getCapabilities ? track.getCapabilities() : {};
+        await loadRequiredScripts(); // تحميل المحركات
 
-          if (capabilities.focusMode && capabilities.focusMode.includes('continuous')) {
-            await track.applyConstraints({
-              advanced: [{ focusMode: 'continuous' }]
-            });
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
+        });
+
+        _liveStream = stream;
+        const vid = document.getElementById('live-video');
+        vid.srcObject = stream;
+        vid.style.display = 'block';
+        await vid.play();
+
+        _liveRunning = true;
+        _liveSetUI('running');
+
+        // 1. بدء محرك الباركود و QR (سريع جداً: كل 300 مللي ثانية)
+        const codeReader = new ZXing.BrowserMultiFormatReader();
+        _liveZxingReader = codeReader;
+
+        codeReader.decodeFromVideoElement(vid, (result, err) => {
+          if (result && _liveEnabled.barcode) {
+            _liveAddFeedItem('barcode', result.getText(), result.getBarcodeFormat());
+            // تنبيه صوتي خفيف عند النجاح (اختياري)
+            if (window.vibrate) navigator.vibrate(50);
           }
-          break;
-        } catch (e) {
-          lastErr = e;
-          if (e.name === 'NotAllowedError') break;
+        });
+
+        // 2. بدء محرك OCR (النصوص) (أبطأ قليلاً لتوفير المعالج: كل 2 ثانية)
+        if (!_liveOCRWorker) {
+          _liveOCRWorker = await Tesseract.createWorker('eng');
+          await _liveOCRWorker.setParameters({
+            tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-/. ',
+          });
         }
+
+        _liveOCRTimer = setInterval(async () => {
+          if (!_liveRunning || !_liveEnabled.ocr || _liveOCRBusy) return;
+
+          _liveOCRBusy = true;
+          const canvas = document.getElementById('live-ocr-canvas');
+          const ctx = canvas.getContext('2d');
+
+          // نأخذ لقطة من الفيديو للمسح
+          canvas.width = vid.videoWidth;
+          canvas.height = vid.videoHeight;
+          ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
+
+          try {
+            const { data: { text, confidence } } = await _liveOCRWorker.recognize(canvas);
+            if (confidence > 70) {
+              const lines = text.split('\n').filter(l => l.trim().length > 4);
+              lines.forEach(line => {
+                // استخراج الكلمات التي تبدو كأرقام تسلسلية أو باركود
+                const matches = line.match(/[A-Z0-9-]{5,}/g);
+                if (matches) {
+                  matches.forEach(m => _liveAddFeedItem('ocr', m, `ثقة: ${Math.round(confidence)}%`));
+                }
+              });
+            }
+          } catch (e) {
+            console.error("OCR Error:", e);
+          } finally {
+            _liveOCRBusy = false;
+          }
+        }, 2000);
+
+      } catch (err) {
+        _liveShowError('فشل الكاميرا', 'تعذر الوصول إلى الكاميرا: ' + err.message);
+      }
+    }
+
+    // دالة إيقاف المسح بشكل نظيف
+    function stopLiveAutoScanner() {
+      _liveRunning = false;
+      if (_liveBarcodeTimer) clearInterval(_liveBarcodeTimer);
+      if (_liveOCRTimer) clearInterval(_liveOCRTimer);
+
+      if (_liveZxingReader) {
+        _liveZxingReader.reset();
+        _liveZxingReader = null;
       }
 
-      if (!stream) {
-        _liveShowError('Camera unavailable', 'Could not start camera.');
-        return;
+      if (_liveStream) {
+        _liveStream.getTracks().forEach(track => track.stop());
+        _liveStream = null;
       }
-
-      _liveStream = stream;
-      _liveTrack = stream.getVideoTracks()[0];
-
-      _liveZoom = 1.0;
-      _liveZoomMode = 'software';
-      _liveZoomMin = 1.0;
-      _liveZoomMax = 5.0;
-      _liveZoomStep = 0.1;
-
-      try {
-        const caps = _liveTrack.getCapabilities ? _liveTrack.getCapabilities() : {};
-        if (caps.torch) {
-          const torchBtn = document.getElementById('live-tog-torch');
-          if (torchBtn) torchBtn.style.display = '';
-        }
-        if (caps.zoom && typeof caps.zoom.max === 'number' && caps.zoom.max > (caps.zoom.min || 1)) {
-          _liveZoomMode = 'hardware';
-          _liveZoomMin = caps.zoom.min || 1;
-          _liveZoomMax = Math.min(caps.zoom.max, 10);
-          _liveZoomStep = caps.zoom.step || 0.1;
-          _liveZoom = _liveTrack.getSettings?.().zoom || _liveZoomMin;
-        }
-      } catch (e) { console.warn('[live-zoom] capability check failed:', e); }
-
-      const slider = document.getElementById('live-zoom-slider');
-      if (slider) {
-        slider.min = _liveZoomMin;
-        slider.max = _liveZoomMax;
-        slider.step = Math.max(_liveZoomStep, 0.05);
-        slider.value = _liveZoom;
-      }
-      _liveUpdateZoomUI();
 
       const vid = document.getElementById('live-video');
-
-      // التأكد من إيقاف أي بث قديم قبل البدء
-      if (vid.srcObject) {
-        vid.srcObject.getTracks().forEach(track => track.stop());
-      }
-
-      vid.srcObject = stream;
-      vid.setAttribute("playsinline", true); // مهم جداً للأيفون والكروم
-
-      // حل مشكلة Trying to play video that is already playing
-      vid.onloadedmetadata = () => {
-        vid.play().catch(e => console.log("Video play deferred"));
-      };
-      try { await vid.play(); } catch (e) { console.warn('[live] play rejected:', e); }
-
-      // --- الإصلاح هنا: تفعيل المحركات برمجياً عند البدء ---
-      _liveEnabled.barcode = true;
-      _liveEnabled.ocr = true;
-      _liveRunning = true;
-      _liveAutoApplied = false; // لإعادة تفعيل القراءة الآلية لأول عنصر يظهر
-
-      _liveSetUI('running');
-      _attachLiveZoomGestures();
-
-      // تشغيل المحركين معاً
-      _startLiveBarcodeLoop();
-      _startLiveOCRLoop();
+      if (vid) vid.srcObject = null;
     }
 
     // ── Barcode scanning: runs BarcodeDetector + ZXing + Quagga2 IN PARALLEL ──
@@ -10693,83 +10678,15 @@
     // (EAN/UPC/Code128). ZXing is rock-solid on 1D. Quagga2 is a third-layer
     // backup specialized purely for 1D linear barcodes. Deduplication prevents
     // feed spam when multiple engines detect the same code simultaneously.
-    // --- استبدل دالة _startLiveBarcodeLoop بهذا الكود ---
-    // --- محرك الباركود المباشر ---
     async function _startLiveBarcodeLoop() {
-      if (!_liveRunning) return;
-      const vid = document.getElementById('live-video');
-
-      // تحميل مكتبة ZXing فوراً للأيفون
-      if (!window.ZXing) {
-        await loadScript('https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js');
-      }
-
-      // إعداد القارئ بـ Hints لزيادة السرعة (خاص للأيفون)
-      const hints = new Map();
-      const formats = [
-        window.ZXing.BarcodeFormat.QR_CODE,
-        window.ZXing.BarcodeFormat.EAN_13,
-        window.ZXing.BarcodeFormat.CODE_128,
-        window.ZXing.BarcodeFormat.UPC_A
-      ];
-      hints.set(window.ZXing.DecodeHintType.POSSIBLE_FORMATS, formats);
-      hints.set(window.ZXing.DecodeHintType.TRY_HARDER, true); // مهم جداً للأيفون لتحسين التركيز
-
-      const codeReader = new window.ZXing.BrowserMultiFormatReader(hints);
-      _liveZxingReader = codeReader;
-
-      // بدأ المسح مع معالجة خطأ "Video already playing" المشهور في الأيفون
-      try {
-        codeReader.decodeFromVideoElement(vid, (result, err) => {
-          if (result && _liveRunning) {
-            // getText() تجلب القيمة سواء كانت أرقام أو حروف أو روابط
-            const code = result.getText();
-            _liveAddFeedItem('barcode', code, result.getBarcodeFormat());
-          }
-        });
-      } catch (err) {
-        console.warn("Retrying scan...");
-      }
-    }
-
-    // --- محرك النصوص المباشر ---
-    async function _startLiveOCRLoop() {
-      if (!_liveRunning || _liveOCRBusy) return;
-      await loadTesseractWorker();
+      if (!_liveRunning || !_liveEnabled.barcode) return;
 
       const vid = document.getElementById('live-video');
-      const canvas = document.createElement('canvas');
-      const ctx = canvas.getContext('2d');
 
-      _liveOCRTimer = setInterval(async () => {
-        if (!_liveRunning || _liveOCRBusy || vid.readyState < 2) return;
-
-        _liveOCRBusy = true;
-        canvas.width = vid.videoWidth;
-        canvas.height = vid.videoHeight;
-        ctx.drawImage(vid, 0, 0);
-
-        try {
-          const { data: { text } } = await ocrWorker.recognize(canvas);
-          const cleanText = text.replace(/[^A-Z0-9]/gi, '').trim();
-
-          if (cleanText.length > 4) { // لو لقى كود أطول من 4 حروف
-            _liveAddFeedItem('ocr', cleanText, "Detected Live");
-          }
-        } catch (e) { } finally { _liveOCRBusy = false; }
-      }, 3000); // يحلل النص كل 3 ثواني عشان ميهنجش الكاميرا
-      // --- استبدل الجزء اللي جوه words.forEach في دالة _startLiveOCRLoop ---
-      words.forEach(word => {
-        // تنظيف الكلمة: السماح بالأرقام والحروف وعلامات الناقص والشرطة المائلة
-        const clean = word.text.trim().replace(/[^a-zA-Z0-9\-/]/g, '');
-
-        // الشروط الجديدة:
-        // 1. لو هي أرقام فقط وطولها 4 أو أكثر
-        // 2. أو لو هي خليط حروف وأرقام (سيريال) وطولها 4 أو أكثر
-        if (clean.length >= 4 && word.confidence > 60) {
-          _liveAddFeedItem('ocr', clean, `رقم/سيريال (${Math.round(word.confidence)}%)`);
-        }
-      });
+      // Start all available engines in parallel — each runs independently.
+      _startLiveBDEngine(vid);           // Engine 1: Native BarcodeDetector (2D-focused)
+      _startLiveZxingEngine(vid);        // Engine 2: ZXing via esm.sh (1D + 2D, reliable)
+      _startLiveQuaggaEngine(vid);       // Engine 3: Quagga2 (1D specialist, backup)
     }
 
     // ── Engine 1: Native BarcodeDetector (Chrome/Edge/Android) ───────
@@ -10911,41 +10828,95 @@
 
     // ── OCR loop: every 2.5s, non-blocking ─────────────────────────
     async function _startLiveOCRLoop() {
-      if (!_liveRunning || !_liveEnabled.ocr || _liveOCRBusy) return;
+      if (!_liveRunning || !_liveEnabled.ocr) return;
 
+      // Lazy-load Tesseract (don't block camera start)
       if (!ocrReady || !ocrWorker) {
-        await loadTesseractWorker(); // تأكد من تحميل المحرك
+        _liveSetStatus('Loading OCR engine (first time only)...');
+        try {
+          await loadTesseractWorker(() => { });
+        } catch (e) {
+          console.warn('[live] Tesseract load failed:', e);
+        }
       }
+      if (!ocrReady || !ocrWorker) {
+        _liveSetStatus('OCR unavailable — barcode scanning active');
+        return;
+      }
+
+      _liveSetStatus('Scanning — point at barcode or text');
 
       const vid = document.getElementById('live-video');
       const canvas = document.getElementById('live-ocr-canvas');
       const ctx = canvas.getContext('2d');
 
-      // محرك الـ OCR هيشتغل كل ثانيتين عشان ميستهلكش البطارية ويهنج المتصفح
       _liveOCRTimer = setInterval(async () => {
         if (!_liveRunning || !_liveEnabled.ocr || _liveOCRBusy) return;
         if (vid.readyState < 2 || vid.videoWidth === 0) return;
 
         _liveOCRBusy = true;
         try {
-          // التقاط صورة من الفيديو الحالي
-          canvas.width = vid.videoWidth;
-          canvas.height = vid.videoHeight;
-          ctx.drawImage(vid, 0, 0);
+          // Capture a generous central region (90% w × 70% h) so labels aren't cut off.
+          const r = _liveGetCaptureRegion(vid.videoWidth, vid.videoHeight, 0.9, 0.7);
+          canvas.width = r.w;
+          canvas.height = r.h;
+          ctx.drawImage(vid, r.x, r.y, r.w, r.h, 0, 0, r.w, r.h);
 
-          // تحليل الصورة
-          const { data: { text, words } } = await ocrWorker.recognize(canvas);
+          // Frame stability: only use it to DOWNGRADE confidence, never to skip entirely.
+          const sig = _liveComputeFrameSig(canvas);
+          const stable = _liveFrameIsStable(sig, _liveOCRPrevSig);
+          _liveOCRPrevSig = sig;
+          _liveOCRFramesSeen++;
 
-          // نبحث عن الكلمات القوية (سيريالات أو أكواد نصية)
-          words.forEach(word => {
-            const clean = word.text.trim().replace(/[^a-zA-Z0-9-]/g, '');
-            // لو الكلمة طولها أكتر من 4 وحروفها واضحة
-            if (clean.length >= 4 && word.confidence > 70) {
-              _liveAddFeedItem('ocr', clean, `Confidence: ${Math.round(word.confidence)}%`);
+          // Run Tesseract
+          const { data } = await ocrWorker.recognize(canvas);
+          const overallConf = data?.confidence || 0;
+          const rawText = (data?.text || '').trim();
+
+          // Debug log — helps diagnose if OCR is actually running
+          if (rawText) {
+            console.log('[live-ocr] text:', JSON.stringify(rawText.slice(0, 80)),
+              '| overall conf:', Math.round(overallConf),
+              '| stable:', stable, '| words:', data?.words?.length || 0);
+          }
+
+          if (!rawText || overallConf < 25) {
+            return; // truly nothing readable
+          }
+
+          // ── Strategy: emit everything reasonable, let user pick. ──
+          // 1. Raw lines (3+ chars) — shows user that OCR IS working and what it sees
+          // 2. Serial-like tokens from each line — highlighted as likely candidates
+          const lines = rawText.split('\n').map(l => l.trim()).filter(l => l.length >= 3);
+          const confBadge = `conf ${Math.round(overallConf)}%`;
+
+          for (const line of lines) {
+            // Skip pure-punctuation / pure-whitespace garbage
+            if (!/[A-Za-z0-9]/.test(line)) continue;
+            // Skip lines that are just a single short noise token (<3 chars real content)
+            const alnumOnly = line.replace(/[^A-Za-z0-9]/g, '');
+            if (alnumOnly.length < 3) continue;
+
+            // Add the full line (useful: may be a brand name, model, or multi-word serial)
+            if (line.length <= 60) {
+              _liveAddFeedItem('ocr', line, confBadge);
             }
-          });
+
+            // Also extract tight serial-like tokens from the line (no spaces, alnum + dash/dot/underscore)
+            const tokens = line.split(/\s+/).filter(t =>
+              t.length >= 4 && t.length <= 40 &&
+              /^[A-Z0-9][A-Z0-9\-_./:#]*$/i.test(t) &&
+              !/^(.)\1+$/.test(t) // reject all-same-char noise like "0000"
+            );
+            for (const tok of tokens) {
+              // Avoid adding the same string twice if line == token
+              if (tok !== line) {
+                _liveAddFeedItem('ocr', tok, confBadge + ' · token');
+              }
+            }
+          }
         } catch (e) {
-          console.warn("Live OCR Error:", e);
+          console.warn('[live] OCR tick error:', e);
         } finally {
           _liveOCRBusy = false;
         }
