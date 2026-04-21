@@ -10576,6 +10576,22 @@
       }
 
       let stream, lastErr;
+      const constraints = {
+        video: {
+          facingMode: "environment",
+          // نستخدم الـ ideal بدل الـ exact عشان الأيفون ميرفضش الطلب
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        },
+        audio: false
+      };
+
+      try {
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+      } catch (e) {
+        // محاولة أخيرة لو الأيفون رفض الإعدادات العالية
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+      }
       for (const c of [
         { video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } } },
         { video: { facingMode: 'environment' } },
@@ -10677,30 +10693,35 @@
       if (!_liveRunning) return;
       const vid = document.getElementById('live-video');
 
+      // تحميل مكتبة ZXing فوراً للأيفون
+      if (!window.ZXing) {
+        await loadScript('https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js');
+      }
+
+      // إعداد القارئ بـ Hints لزيادة السرعة (خاص للأيفون)
+      const hints = new Map();
+      const formats = [
+        window.ZXing.BarcodeFormat.QR_CODE,
+        window.ZXing.BarcodeFormat.EAN_13,
+        window.ZXing.BarcodeFormat.CODE_128,
+        window.ZXing.BarcodeFormat.UPC_A
+      ];
+      hints.set(window.ZXing.DecodeHintType.POSSIBLE_FORMATS, formats);
+      hints.set(window.ZXing.DecodeHintType.TRY_HARDER, true); // مهم جداً للأيفون لتحسين التركيز
+
+      const codeReader = new window.ZXing.BrowserMultiFormatReader(hints);
+      _liveZxingReader = codeReader;
+
+      // بدأ المسح مع معالجة خطأ "Video already playing" المشهور في الأيفون
       try {
-        // تحميل المكتبة لو مش موجودة
-        if (!window.ZXing) {
-          await loadScript('https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js');
-        }
-
-        // تنظيف أي محركات سابقة لمنع رسالة Video already playing
-        if (_liveZxingReader) {
-          _liveZxingReader.reset();
-        }
-
-        const codeReader = new window.ZXing.BrowserMultiFormatReader();
-        _liveZxingReader = codeReader;
-
-        // تشغيل القارئ المباشر
         codeReader.decodeFromVideoElement(vid, (result, err) => {
           if (result && _liveRunning) {
-            console.log("Found:", result.getText());
             _liveAddFeedItem('barcode', result.getText(), result.getBarcodeFormat());
             if (window.navigator.vibrate) window.navigator.vibrate(50);
           }
         });
-      } catch (e) {
-        console.error("Live Scan Error:", e);
+      } catch (err) {
+        console.warn("Retrying scan...");
       }
     }
 
