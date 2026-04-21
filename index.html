@@ -603,6 +603,34 @@
       background: rgba(16, 185, 129, .04);
     }
 
+    /* صندوق التركيز الذكي */
+    .scanner-focus-region {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 280px;
+      height: 80px;
+      border: 2px solid var(--amber);
+      border-radius: 12px;
+      box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.6);
+      /* تعتيم ما حول الصندوق */
+      z-index: 20;
+      pointer-events: none;
+    }
+
+    .scanner-focus-region::after {
+      content: "ضع النص أو الرقم هنا";
+      position: absolute;
+      bottom: -30px;
+      left: 0;
+      width: 100%;
+      text-align: center;
+      color: var(--amber);
+      font-size: 12px;
+      font-weight: 600;
+    }
+
     @media (max-width:767px) {
       .sc-table-wrap {
         overflow-x: auto;
@@ -6755,6 +6783,8 @@
         <div class="scan-viewport-wrap">
           <video id="scan-video" autoplay playsinline muted
             style="width:100%;max-height:260px;display:none;background:#000;object-fit:cover"></video>
+          <div class="scanner-focus-region"></div> <!-- البرواز الأصفر -->
+          <canvas id="live-ocr-canvas" style="display:none"></canvas>
           <canvas id="scan-canvas" style="display:none"></canvas>
           <div class="scan-overlay-frame" id="scan-frame-overlay" style="display:none">
             <div class="scan-frame-box"></div>
@@ -10932,100 +10962,80 @@
     }
 
     // ── OCR loop: every 2.5s, non-blocking ─────────────────────────
-    async function _startLiveOCRLoop() {
-      if (!_liveRunning || !_liveEnabled.ocr) return;
 
-      // Lazy-load Tesseract (don't block camera start)
-      if (!ocrReady || !ocrWorker) {
-        _liveSetStatus('Loading OCR engine (first time only)...');
-        try {
-          await loadTesseractWorker(() => { });
-        } catch (e) {
-          console.warn('[live] Tesseract load failed:', e);
+    // تجهيز المحرك بإعدادات احترافية
+    async function initAdvancedOCR() {
+      if (_ocrWorker) return _ocrWorker;
+
+      _liveSetStatus("جاري تشغيل المحرك الذكي...");
+      _ocrWorker = await Tesseract.createWorker('eng', 1, {
+        logger: m => {
+          if (m.status === 'recognizing text') {
+            _liveSetStatus(`جاري القراءة: ${Math.round(m.progress * 100)}%`);
+          }
         }
-      }
-      if (!ocrReady || !ocrWorker) {
-        _liveSetStatus('OCR unavailable — barcode scanning active');
-        return;
-      }
+      });
 
-      _liveSetStatus('Scanning — point at barcode or text');
+      // إعدادات لتقليل الخطأ: السماح فقط بالأرقام والحروف الكبيرة (مثالي للباركود والـ Serial)
+      await _ocrWorker.setParameters({
+        tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-/',
+        tessedit_pageseg_mode: '7', // وضع السطر الواحد (Single Line) لزيادة الدقة 100%
+      });
 
+      return _ocrWorker;
+    }
+
+    async function _startLiveOCRLoop() {
+      if (!_liveRunning || !_liveEnabled.ocr || _liveOCRBusy) return;
+
+      const worker = await initAdvancedOCR();
       const vid = document.getElementById('live-video');
       const canvas = document.getElementById('live-ocr-canvas');
       const ctx = canvas.getContext('2d');
 
       _liveOCRTimer = setInterval(async () => {
         if (!_liveRunning || !_liveEnabled.ocr || _liveOCRBusy) return;
-        if (vid.readyState < 2 || vid.videoWidth === 0) return;
+        if (vid.readyState < 2) return;
 
         _liveOCRBusy = true;
+
+        // 1. تحديد منطقة الصندوق الأصفر فقط (CROP)
+        // هذا يجعل المعالجة أسرع 10 مرات لأننا لا نمسح الشاشة كاملة
+        const scale = vid.videoWidth / vid.offsetWidth;
+        const scanRegion = {
+          w: 280 * scale,
+          h: 80 * scale,
+          x: (vid.videoWidth - 280 * scale) / 2,
+          y: (vid.videoHeight - 80 * scale) / 2
+        };
+
+        canvas.width = scanRegion.w;
+        canvas.height = scanRegion.h;
+
+        // 2. الفلتر السحري (Pre-processing)
+        // تحويل الصورة لرمادي + زيادة التباين (يجعل النص أسود فاحم والخلفية بيضاء)
+        ctx.filter = 'grayscale(100%) contrast(200%) brightness(120%)';
+        ctx.drawImage(vid, scanRegion.x, scanRegion.y, scanRegion.w, scanRegion.h, 0, 0, scanRegion.w, scanRegion.h);
+
         try {
-          // Capture a generous central region (90% w × 70% h) so labels aren't cut off.
-          const r = _liveGetCaptureRegion(vid.videoWidth, vid.videoHeight, 0.9, 0.7);
-          canvas.width = r.w;
-          canvas.height = r.h;
-          ctx.drawImage(vid, r.x, r.y, r.w, r.h, 0, 0, r.w, r.h);
+          const { data: { text, confidence } } = await worker.recognize(canvas);
 
-          // Frame stability: only use it to DOWNGRADE confidence, never to skip entirely.
-          const sig = _liveComputeFrameSig(canvas);
-          const stable = _liveFrameIsStable(sig, _liveOCRPrevSig);
-          _liveOCRPrevSig = sig;
-          _liveOCRFramesSeen++;
+          // 3. فلترة النتائج (لا تقبل أي نص ثقته أقل من 70%)
+          if (confidence > 70) {
+            const cleanText = text.replace(/[^A-Z0-9-]/gi, '').trim();
+            if (cleanText.length > 4) {
+              _liveAddFeedItem('ocr', cleanText, `دقة: ${Math.round(confidence)}%`);
 
-          // Run Tesseract
-          const { data } = await ocrWorker.recognize(canvas);
-          const overallConf = data?.confidence || 0;
-          const rawText = (data?.text || '').trim();
-
-          // Debug log — helps diagnose if OCR is actually running
-          if (rawText) {
-            console.log('[live-ocr] text:', JSON.stringify(rawText.slice(0, 80)),
-              '| overall conf:', Math.round(overallConf),
-              '| stable:', stable, '| words:', data?.words?.length || 0);
-          }
-
-          if (!rawText || overallConf < 25) {
-            return; // truly nothing readable
-          }
-
-          // ── Strategy: emit everything reasonable, let user pick. ──
-          // 1. Raw lines (3+ chars) — shows user that OCR IS working and what it sees
-          // 2. Serial-like tokens from each line — highlighted as likely candidates
-          const lines = rawText.split('\n').map(l => l.trim()).filter(l => l.length >= 3);
-          const confBadge = `conf ${Math.round(overallConf)}%`;
-
-          for (const line of lines) {
-            // Skip pure-punctuation / pure-whitespace garbage
-            if (!/[A-Za-z0-9]/.test(line)) continue;
-            // Skip lines that are just a single short noise token (<3 chars real content)
-            const alnumOnly = line.replace(/[^A-Za-z0-9]/g, '');
-            if (alnumOnly.length < 3) continue;
-
-            // Add the full line (useful: may be a brand name, model, or multi-word serial)
-            if (line.length <= 60) {
-              _liveAddFeedItem('ocr', line, confBadge);
-            }
-
-            // Also extract tight serial-like tokens from the line (no spaces, alnum + dash/dot/underscore)
-            const tokens = line.split(/\s+/).filter(t =>
-              t.length >= 4 && t.length <= 40 &&
-              /^[A-Z0-9][A-Z0-9\-_./:#]*$/i.test(t) &&
-              !/^(.)\1+$/.test(t) // reject all-same-char noise like "0000"
-            );
-            for (const tok of tokens) {
-              // Avoid adding the same string twice if line == token
-              if (tok !== line) {
-                _liveAddFeedItem('ocr', tok, confBadge + ' · token');
-              }
+              // تنبيه بالاهتزاز عند القراءة الناجحة (يعمل على أندرويد)
+              if (navigator.vibrate) navigator.vibrate(50);
             }
           }
         } catch (e) {
-          console.warn('[live] OCR tick error:', e);
+          console.error("OCR Error:", e);
         } finally {
           _liveOCRBusy = false;
         }
-      }, 2000);
+      }, 1200); // القراءة كل ثانية لضمان عدم تعليق المتصفح
     }
 
     // ── Stop everything ────────────────────────────────────────────
