@@ -10253,23 +10253,24 @@
     async function loadTesseractWorker() {
       if (ocrWorker && ocrReady) return;
       try {
-        // تحميل المكتبة برابط مباشر وسريع
         if (!window.Tesseract) {
           await loadScript('https://cdn.jsdelivr.net/npm/tesseract.js@5.0.4/dist/tesseract.min.js');
         }
 
-        ocrWorker = await Tesseract.createWorker('eng');
+        // إعداد المحرك للعمل بدون الحاجة لتخزين محلي (حل مشكلة Tracking Prevention)
+        ocrWorker = await Tesseract.createWorker('eng', 1, {
+          workerPath: 'https://cdn.jsdelivr.net/npm/tesseract.js@5.0.4/dist/worker.min.js',
+          corePath: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@5.0.0/tesseract-core.wasm.js',
+          logger: m => console.log(m.status)
+        });
 
-        // إعدادات خاصة لقراءة السيريالات والأرقام بوضوح
         await ocrWorker.setParameters({
           tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-/.',
-          tessedit_pageseg_mode: '7', // معاملة النص كسطر واحد
+          tessedit_pageseg_mode: '7',
         });
         ocrReady = true;
-        console.log("OCR محرك جاهز للعمل");
       } catch (e) {
-        console.error("فشل تحميل محرك OCR:", e);
-        toast("فشل تحميل محرك النصوص، تأكد من اتصال الإنترنت", "error");
+        console.error("OCR Error:", e);
       }
     }
 
@@ -10636,17 +10637,19 @@
       _liveUpdateZoomUI();
 
       const vid = document.getElementById('live-video');
-      vid.srcObject = stream;
-      vid.style.display = 'block';
-      vid.style.transform = 'scale(1)';
 
-      await new Promise(res => {
-        let done = false;
-        const finish = () => { if (!done) { done = true; res(); } };
-        vid.onloadedmetadata = finish;
-        vid.oncanplay = finish;
-        setTimeout(finish, 4000);
-      });
+      // التأكد من إيقاف أي بث قديم قبل البدء
+      if (vid.srcObject) {
+        vid.srcObject.getTracks().forEach(track => track.stop());
+      }
+
+      vid.srcObject = stream;
+      vid.setAttribute("playsinline", true); // مهم جداً للأيفون والكروم
+
+      // حل مشكلة Trying to play video that is already playing
+      vid.onloadedmetadata = () => {
+        vid.play().catch(e => console.log("Video play deferred"));
+      };
       try { await vid.play(); } catch (e) { console.warn('[live] play rejected:', e); }
 
       // --- الإصلاح هنا: تفعيل المحركات برمجياً عند البدء ---
@@ -10674,20 +10677,31 @@
       if (!_liveRunning) return;
       const vid = document.getElementById('live-video');
 
-      if (!window.ZXing) {
-        await loadScript('https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js');
-      }
-
-      const codeReader = new window.ZXing.BrowserMultiFormatReader();
-
-      // بيبدأ يراقب الكاميرا "لايف"
-      codeReader.decodeFromVideoElement(vid, (result, err) => {
-        if (result && _liveRunning) {
-          _liveAddFeedItem('barcode', result.getText(), result.getBarcodeFormat());
-          if (window.navigator.vibrate) window.navigator.vibrate(50);
+      try {
+        // تحميل المكتبة لو مش موجودة
+        if (!window.ZXing) {
+          await loadScript('https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js');
         }
-      });
-      _liveZxingReader = codeReader;
+
+        // تنظيف أي محركات سابقة لمنع رسالة Video already playing
+        if (_liveZxingReader) {
+          _liveZxingReader.reset();
+        }
+
+        const codeReader = new window.ZXing.BrowserMultiFormatReader();
+        _liveZxingReader = codeReader;
+
+        // تشغيل القارئ المباشر
+        codeReader.decodeFromVideoElement(vid, (result, err) => {
+          if (result && _liveRunning) {
+            console.log("Found:", result.getText());
+            _liveAddFeedItem('barcode', result.getText(), result.getBarcodeFormat());
+            if (window.navigator.vibrate) window.navigator.vibrate(50);
+          }
+        });
+      } catch (e) {
+        console.error("Live Scan Error:", e);
+      }
     }
 
     // --- محرك النصوص المباشر ---
