@@ -10127,10 +10127,31 @@
 
     // ── File handler ─────────────────────────────────────────────
     async function handleOCRUpload(event) {
-      const file = event.target.files?.[0];
-      event.target.value = '';
+      const file = event.target.files[0];
       if (!file) return;
-      await runOCROnFile(file);
+
+      // إظهار واجهة التحميل
+      document.getElementById('ocr-idle').style.display = 'none';
+      document.getElementById('ocr-processing').style.display = 'block';
+      document.getElementById('ocr-progress-bar').style.width = '20%';
+
+      try {
+        await loadTesseractWorker(); // تأكد من جاهزية المحرك
+
+        const result = await ocrWorker.recognize(file);
+        const text = result.data.text.trim();
+
+        if (text) {
+          displayOCRResult(text, result.data.words);
+          document.getElementById('ocr-processing').style.display = 'none';
+          document.getElementById('ocr-result-box').classList.add('show');
+        } else {
+          throw new Error("لم يتم العثور على نص");
+        }
+      } catch (e) {
+        toast("لم نتمكن من قراءة النص، حاول مرة أخرى", "error");
+        resetOCRPanel();
+      }
     }
 
     // ── Run OCR on image file ─────────────────────────────────────
@@ -10226,6 +10247,29 @@
         ocrReady = true;
       } catch (e) {
         console.warn('OCR Init failed:', e);
+      }
+    }
+
+    async function loadTesseractWorker() {
+      if (ocrWorker && ocrReady) return;
+      try {
+        // تحميل المكتبة برابط مباشر وسريع
+        if (!window.Tesseract) {
+          await loadScript('https://cdn.jsdelivr.net/npm/tesseract.js@5.0.4/dist/tesseract.min.js');
+        }
+
+        ocrWorker = await Tesseract.createWorker('eng');
+
+        // إعدادات خاصة لقراءة السيريالات والأرقام بوضوح
+        await ocrWorker.setParameters({
+          tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-/.',
+          tessedit_pageseg_mode: '7', // معاملة النص كسطر واحد
+        });
+        ocrReady = true;
+        console.log("OCR محرك جاهز للعمل");
+      } catch (e) {
+        console.error("فشل تحميل محرك OCR:", e);
+        toast("فشل تحميل محرك النصوص، تأكد من اتصال الإنترنت", "error");
       }
     }
 
@@ -10625,32 +10669,53 @@
     // backup specialized purely for 1D linear barcodes. Deduplication prevents
     // feed spam when multiple engines detect the same code simultaneously.
     // --- استبدل دالة _startLiveBarcodeLoop بهذا الكود ---
+    // --- محرك الباركود المباشر ---
     async function _startLiveBarcodeLoop() {
-      if (!_liveRunning || !_liveEnabled.barcode) return;
+      if (!_liveRunning) return;
       const vid = document.getElementById('live-video');
 
-      // تحميل المكتبة لو مش موجودة
       if (!window.ZXing) {
         await loadScript('https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js');
       }
 
-      // استخدام القارئ الشامل (يقرأ كل شيء: QR, Barcode, etc)
       const codeReader = new window.ZXing.BrowserMultiFormatReader();
 
-      // بدأ المسح المباشر من الفيديو
+      // بيبدأ يراقب الكاميرا "لايف"
       codeReader.decodeFromVideoElement(vid, (result, err) => {
-        if (result && _liveRunning && _liveEnabled.barcode) {
-          const code = result.getText();
-          // إضافة النتيجة للقائمة تحت الكاميرا
-          _liveAddFeedItem('barcode', code, result.getBarcodeFormat());
-
-          // اهتزاز الموبايل للتنبيه
+        if (result && _liveRunning) {
+          _liveAddFeedItem('barcode', result.getText(), result.getBarcodeFormat());
           if (window.navigator.vibrate) window.navigator.vibrate(50);
         }
-        // نتجاهل الأخطاء العادية (لما ميكونش فيه باركود قدام الكاميرا)
       });
-
       _liveZxingReader = codeReader;
+    }
+
+    // --- محرك النصوص المباشر ---
+    async function _startLiveOCRLoop() {
+      if (!_liveRunning || _liveOCRBusy) return;
+      await loadTesseractWorker();
+
+      const vid = document.getElementById('live-video');
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+
+      _liveOCRTimer = setInterval(async () => {
+        if (!_liveRunning || _liveOCRBusy || vid.readyState < 2) return;
+
+        _liveOCRBusy = true;
+        canvas.width = vid.videoWidth;
+        canvas.height = vid.videoHeight;
+        ctx.drawImage(vid, 0, 0);
+
+        try {
+          const { data: { text } } = await ocrWorker.recognize(canvas);
+          const cleanText = text.replace(/[^A-Z0-9]/gi, '').trim();
+
+          if (cleanText.length > 4) { // لو لقى كود أطول من 4 حروف
+            _liveAddFeedItem('ocr', cleanText, "Detected Live");
+          }
+        } catch (e) { } finally { _liveOCRBusy = false; }
+      }, 3000); // يحلل النص كل 3 ثواني عشان ميهنجش الكاميرا
     }
 
     // ── Engine 1: Native BarcodeDetector (Chrome/Edge/Android) ───────
