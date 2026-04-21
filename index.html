@@ -10462,32 +10462,38 @@
       const feed = document.getElementById('live-feed');
       if (!feed) return;
 
-      // إزالة رسالة "Point camera..."
-      const empty = feed.querySelector('.live-feed-empty');
-      if (empty) empty.remove();
+      // تنظيف القيمة من أي مسافات زائدة
+      const displayValue = value.trim();
 
-      // منع التكرار في القائمة (لو نفس الكود اتقرأ مرتين ورا بعض)
-      if (_liveRecentHits.has(value)) return;
-      _liveRecentHits.set(value, Date.now());
+      // منع التكرار
+      if (_liveRecentHits.has(displayValue)) return;
+      _liveRecentHits.set(displayValue, Date.now());
 
       const item = document.createElement('div');
       item.className = 'live-feed-item ' + kind;
-      item.innerHTML = `
-    <div class="live-feed-item-icon">${kind === 'barcode' ? '📷' : 'T'}</div>
-    <div class="live-feed-item-body">
-      <div class="live-feed-item-val">${value}</div>
-      <div class="live-feed-item-meta">${meta || ''}</div>
-    </div>
-    <button class="live-feed-item-use">استخدام</button>
-  `;
 
-      // عند الضغط على النتيجة، ضعها في الخانة الأساسية واقفل الكاميرا
+      // تحديد الأيقونة: لو لينك يظهر علامة رابط، لو رقم يظهر علامة باركود
+      const isUrl = displayValue.startsWith('http');
+      const icon = isUrl ? '🔗' : (kind === 'barcode' ? '🔢' : '📝');
+      const label = isUrl ? 'رابط (URL)' : 'كود / رقم';
+
+      item.innerHTML = `
+        <div class="live-feed-item-icon" style="font-size:20px">${icon}</div>
+        <div class="live-feed-item-body">
+            <div class="live-feed-item-val" style="word-break: break-all; font-family: monospace;">${displayValue}</div>
+            <div class="live-feed-item-meta">${label} · ${meta || ''}</div>
+        </div>
+        <button class="live-feed-item-use">استخدام</button>
+    `;
+
       item.onclick = () => {
-        document.getElementById('f-barcode').value = value;
+        document.getElementById('f-barcode').value = displayValue;
+        toast("تم اختيار الرقم: " + displayValue);
         closeScanModal();
       };
 
       feed.insertBefore(item, feed.firstChild);
+
 
 
       // Cap feed at 8 items
@@ -10716,8 +10722,9 @@
       try {
         codeReader.decodeFromVideoElement(vid, (result, err) => {
           if (result && _liveRunning) {
-            _liveAddFeedItem('barcode', result.getText(), result.getBarcodeFormat());
-            if (window.navigator.vibrate) window.navigator.vibrate(50);
+            // getText() تجلب القيمة سواء كانت أرقام أو حروف أو روابط
+            const code = result.getText();
+            _liveAddFeedItem('barcode', code, result.getBarcodeFormat());
           }
         });
       } catch (err) {
@@ -10751,6 +10758,18 @@
           }
         } catch (e) { } finally { _liveOCRBusy = false; }
       }, 3000); // يحلل النص كل 3 ثواني عشان ميهنجش الكاميرا
+      // --- استبدل الجزء اللي جوه words.forEach في دالة _startLiveOCRLoop ---
+      words.forEach(word => {
+        // تنظيف الكلمة: السماح بالأرقام والحروف وعلامات الناقص والشرطة المائلة
+        const clean = word.text.trim().replace(/[^a-zA-Z0-9\-/]/g, '');
+
+        // الشروط الجديدة:
+        // 1. لو هي أرقام فقط وطولها 4 أو أكثر
+        // 2. أو لو هي خليط حروف وأرقام (سيريال) وطولها 4 أو أكثر
+        if (clean.length >= 4 && word.confidence > 60) {
+          _liveAddFeedItem('ocr', clean, `رقم/سيريال (${Math.round(word.confidence)}%)`);
+        }
+      });
     }
 
     // ── Engine 1: Native BarcodeDetector (Chrome/Edge/Android) ───────
